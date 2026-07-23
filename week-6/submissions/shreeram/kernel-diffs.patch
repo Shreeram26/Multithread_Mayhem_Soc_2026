@@ -1,0 +1,307 @@
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,7 @@
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int priority;                // Scheduling priority: 0=highest, 63=lowest (Week 6, Problem 2)
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -125,6 +125,7 @@
+   p->pid = allocpid();
+   p->state = USED;
+   p->syscalls = 0;   // Week 5, Problem 2: reset the per-process syscall counter
++  p->priority = 31;  // Week 6, Problem 2: default mid-range priority
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -416,6 +417,30 @@
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++// Week 6, Problem 2: priority scheduler.
++//
++// Instead of running every RUNNABLE process in plain proc[] order,
++// each pass now does two scans:
++//   1. Find the smallest priority value among RUNNABLE processes
++//      (0 = highest priority, 63 = lowest), touching one p->lock at
++//      a time and releasing it before moving to the next slot --
++//      never holding two proc locks at once, exactly like the
++//      original loop and exactly like getprocstatebypid()/kill().
++//   2. Scan proc[] again and run every still-RUNNABLE process with
++//      that best priority value. This preserves stock xv6's
++//      round-robin-ish behavior among equal-priority processes while
++//      still preventing lower-priority processes from running while a
++//      higher-priority process is runnable. Each candidate is
++//      re-checked under its own lock before switching, because it may
++//      have changed state between the two scans.
++//
++// Tie-break policy (documented per the assignment): among processes
++// tied for the lowest priority value, scan 2 runs them in proc[]
++// order, just like stock xv6's scheduler loop. This usually, but not
++// necessarily always, tracks PID order -- proc[] slots get reused as
++// processes exit, so slot order and PID order can drift apart on a
++// long-running system. I chose this over a strict lowest-PID-only
++// tie-break so equal-priority CPU-bound processes still take turns.
+ void
+ scheduler(void)
+ {
+@@ -432,29 +457,86 @@
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
++    int best_priority = 64;   // one past the lowest legal priority (0-63)
++
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++      if(p->state == RUNNABLE && p->priority < best_priority) {
++        best_priority = p->priority;
+      }
+       release(&p->lock);
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
++
++    if(best_priority == 64) {
++      // nothing runnable this pass; stop running on this core until
++      // an interrupt.
+       asm volatile("wfi");
++      continue;
++    }
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE && p->priority == best_priority) {
++        // Switch to chosen process.  It is the process's job
++        // to release its lock and then reacquire it
++        // before jumping back to us.
++        p->state = RUNNING;
++        c->proc = p;
++        swtch(&c->context, &p->context);
++
++        // Process is done running for now.
++        // It should have changed its p->state before coming back.
++        c->proc = 0;
++      }
++      release(&p->lock);
++    }
++  }
++}
++
++// Week 6, Problem 2: change the priority of the process with the
++// given pid. Returns the OLD priority on success, or -1 if no
++// process with that pid currently exists. Modeled on
++// getprocstatebypid()'s scan-and-lock-one-at-a-time pattern.
++int
++set_priority_bypid(int pid, int prio)
++{
++  struct proc *p;
++  int old;
++
++  if(prio < 0 || prio > 63)
++    return -1;
++
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED){
++      old = p->priority;
++      p->priority = prio;
++      release(&p->lock);
++      return old;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++// Week 6, Problem 2: read the priority of the process with the given
++// pid, or -1 if no such process currently exists.
++int
++get_priority_bypid(int pid)
++{
++  struct proc *p;
++  int prio;
++
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED){
++      prio = p->priority;
++      release(&p->lock);
++      return prio;
+     }
++    release(&p->lock);
+   }
++  return -1;
+ }
+ 
+ // Switch to scheduler.  Must hold only p->lock
+--- a/kernel/console.c
++++ b/kernel/console.c
+@@ -52,6 +52,25 @@
+   uint e;  // Edit index
+ } cons;
+ 
++// Week 6, Problem 3: expose whether cons.lock is currently held.
++//
++// The assignment describes "extern declare cons.lock in sysproc.c,"
++// but that doesn't actually work cleanly in C: `cons` here is an
++// instance of an ANONYMOUS struct type (no tag name), so another
++// file has no type it could use to declare a matching `extern`
++// variable and then reach into its .lock field -- you'd have to
++// duplicate this exact, otherwise-private struct layout (including
++// the input buffer) into sysproc.c just to read one field. A small
++// accessor function is the standard, robust fix: it keeps `cons`'s
++// layout private to this file, and is exactly the same idea as
++// getprocstatebypid() exposing state from proc[] without exposing
++// proc[] itself.
++int
++cons_lock_held(void)
++{
++  return cons.lock.locked;
++}
++
+ //
+ // user write()s to the console go here.
+ //
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -21,6 +21,7 @@
+ void            consoleinit(void);
+ void            consoleintr(int);
+ void            consputc(int);
++int             cons_lock_held(void);  // Week 6, Problem 3
+ 
+ // exec.c
+ int             exec(char*, char**);
+@@ -87,6 +88,8 @@
+ void            proc_freepagetable(pagetable_t, uint64);
+ int             kill(int);
+ int             getprocstatebypid(int);
++int             set_priority_bypid(int, int);
++int             get_priority_bypid(int);
+ int             killed(struct proc*);
+ void            setkilled(struct proc*);
+ struct cpu*     mycpu(void);
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -23,3 +23,6 @@
+ #define SYS_getsyscount  22   // Week 5, Problem 2
+ #define SYS_getprocstate 23   // Week 5, Problem 3
+ #define SYS_getcmdline   24   // Week 5, Problem 4
++#define SYS_set_priority 25   // Week 6, Problem 2
++#define SYS_get_priority 26   // Week 6, Problem 2
++#define SYS_is_lock_held 27   // Week 6, Problem 3
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,9 @@
+ extern uint64 sys_getsyscount(void);   // Week 5, Problem 2
+ extern uint64 sys_getprocstate(void);  // Week 5, Problem 3
+ extern uint64 sys_getcmdline(void);    // Week 5, Problem 4
++extern uint64 sys_set_priority(void);  // Week 6, Problem 2
++extern uint64 sys_get_priority(void);  // Week 6, Problem 2
++extern uint64 sys_is_lock_held(void);  // Week 6, Problem 3
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -132,6 +135,9 @@
+ [SYS_getsyscount]  sys_getsyscount,
+ [SYS_getprocstate] sys_getprocstate,
+ [SYS_getcmdline]   sys_getcmdline,
++[SYS_set_priority] sys_set_priority,
++[SYS_get_priority] sys_get_priority,
++[SYS_is_lock_held] sys_is_lock_held,
+ };
+ 
+ void
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -166,3 +166,52 @@
+ 
+   return n;
+ }
++
++// Week 6, Problem 2: change the priority of the process with the
++// given pid. Returns the OLD priority on success, -1 if no such
++// process exists. All the table-scanning logic lives in
++// set_priority_bypid() in proc.c, modeled on kill()/getprocstatebypid().
++uint64
++sys_set_priority(void)
++{
++  int pid, prio;
++
++  argint(0, &pid);
++  argint(1, &prio);
++  return set_priority_bypid(pid, prio);
++}
++
++// Week 6, Problem 2: read the priority of the process with the given
++// pid, or -1 if no such process exists.
++uint64
++sys_get_priority(void)
++{
++  int pid;
++
++  argint(0, &pid);
++  return get_priority_bypid(pid);
++}
++
++// Week 6, Problem 3: report whether a given kernel spinlock is
++// currently held. lock_id 0 = tickslock, 1 = the console's cons.lock,
++// anything else is invalid.
++//
++// tickslock is a plain top-level `struct spinlock tickslock;` in
++// kernel/trap.c (NOT kernel/timer.c -- that file doesn't exist in
++// this checkout; see REPORT.md), already extern-declared for us in
++// defs.h, so `tickslock.locked` just works here. cons.lock is a
++// field inside an ANONYMOUS struct instance private to console.c --
++// see the accessor cons_lock_held() added there for why we can't
++// just extern-declare it the way the assignment casually describes.
++uint64
++sys_is_lock_held(void)
++{
++  int lock_id;
++
++  argint(0, &lock_id);
++  if(lock_id == 0)
++    return tickslock.locked;
++  if(lock_id == 1)
++    return cons_lock_held();
++  return -1;
++}
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,9 @@
+ int getsyscount(void);              // Week 5, Problem 2
+ int getprocstate(int);              // Week 5, Problem 3
+ int getcmdline(char *buf, int max); // Week 5, Problem 4
++int set_priority(int pid, int prio); // Week 6, Problem 2
++int get_priority(int pid);           // Week 6, Problem 2
++int is_lock_held(int lock_id);       // Week 6, Problem 3
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -39,3 +39,6 @@
+ entry("getsyscount");
+ entry("getprocstate");
+ entry("getcmdline");
++entry("set_priority");
++entry("get_priority");
++entry("is_lock_held");

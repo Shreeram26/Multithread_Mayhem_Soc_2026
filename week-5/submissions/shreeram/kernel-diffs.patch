@@ -1,0 +1,201 @@
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,5 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int syscalls;                // Total syscalls made by this process (Week 5, Problem 2)
+ };
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -124,6 +124,7 @@
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->syscalls = 0;   // Week 5, Problem 2: reset the per-process syscall counter
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -601,6 +602,30 @@
+     }
+     release(&p->lock);
+   }
++  return -1;
++}
++
++// Week 5, Problem 3: look up the current procstate of the process
++// with the given pid. Returns -1 if no process with that pid exists
++// right now. Modeled directly on kill() above: scan the whole
++// proc[] table, acquire/release each individual p->lock (never more
++// than one at a time -- holding two proc locks at once is how you
++// build a deadlock), and never hold a lock longer than needed.
++int
++getprocstatebypid(int pid)
++{
++  struct proc *p;
++  int state;
++
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED){
++      state = p->state;
++      release(&p->lock);
++      return state;
++    }
++    release(&p->lock);
++  }
+   return -1;
+ }
+ 
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -86,6 +86,7 @@
+ pagetable_t     proc_pagetable(struct proc *);
+ void            proc_freepagetable(pagetable_t, uint64);
+ int             kill(int);
++int             getprocstatebypid(int);
+ int             killed(struct proc*);
+ void            setkilled(struct proc*);
+ struct cpu*     mycpu(void);
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getsyscount  22   // Week 5, Problem 2
++#define SYS_getprocstate 23   // Week 5, Problem 3
++#define SYS_getcmdline   24   // Week 5, Problem 4
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,9 @@
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_getsyscount(void);   // Week 5, Problem 2
++extern uint64 sys_getprocstate(void);  // Week 5, Problem 3
++extern uint64 sys_getcmdline(void);    // Week 5, Problem 4
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +129,9 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getsyscount]  sys_getsyscount,
++[SYS_getprocstate] sys_getprocstate,
++[SYS_getcmdline]   sys_getcmdline,
+ };
+ 
+ void
+@@ -135,6 +141,15 @@
+   struct proc *p = myproc();
+ 
+   num = p->trapframe->a7;
++
++  // Week 5, Problem 2: count this call against the calling process,
++  // unconditionally -- once per call, regardless of which syscall it
++  // was or whether num even turns out to be valid below. This
++  // deliberately includes a call to getsyscount() itself; see
++  // sys_getsyscount() in sysproc.c and REPORT.md for how that's
++  // handled from the caller's point of view.
++  p->syscalls++;
++
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -98,3 +98,71 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++// Week 5, Problem 2: return the total number of syscalls the calling
++// process has made since it started. syscall() in syscall.c
++// increments p->syscalls once per call, BEFORE dispatching to the
++// handler -- which means the increment for this very call to
++// getsyscount() has already happened by the time we get here. We
++// chose to make getsyscount() NOT count itself: we report
++// "syscalls before this query," which is the more useful number for
++// a caller trying to count what it did up to some point in its own
++// code, and subtracting 1 here is the only change needed to get
++// that -- see REPORT.md for the reasoning.
++uint64
++sys_getsyscount(void)
++{
++  return myproc()->syscalls - 1;
++}
++
++// Week 5, Problem 3: return the procstate of the process with the
++// given pid, or -1 if no such process currently exists. All the
++// real work -- safely scanning proc[] under each process's own
++// lock -- lives in getprocstatebypid() in proc.c, modeled on kill().
++uint64
++sys_getprocstate(void)
++{
++  int pid;
++
++  argint(0, &pid);
++  return getprocstatebypid(pid);
++}
++
++// Week 5, Problem 4: copy the calling process's name (p->name, set
++// from argv[0] at exec time) into a user-supplied buffer, truncated
++// to fit and NUL-terminated. Returns the number of bytes copied (not
++// counting the NUL), or -1 if max is invalid or a copy fails.
++//
++// p->name lives in KERNEL memory (inside struct proc). buf is a
++// pointer the user program owns, in USER memory, under a different
++// page table -- writing p->name into *buf directly from the kernel
++// would write through whatever physical page happens to be mapped
++// at that virtual address in the KERNEL's page table, which is not
++// the same physical page the user process would see at that
++// address. copyout() is what actually walks the user pagetable to
++// find the right physical page. See REPORT.md for the full
++// explanation of what would go wrong without it.
++uint64
++sys_getcmdline(void)
++{
++  uint64 buf_va;
++  int max;
++  struct proc *p = myproc();
++  int len, n;
++
++  argaddr(0, &buf_va);
++  argint(1, &max);
++
++  if(max <= 0)
++    return -1;
++
++  len = strlen(p->name);
++  n = len < max - 1 ? len : max - 1;   // leave room for the NUL
++
++  if(copyout(p->pagetable, buf_va, p->name, n) < 0)
++    return -1;
++  if(copyout(p->pagetable, buf_va + n, "\0", 1) < 0)
++    return -1;
++
++  return n;
++}
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,9 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int getsyscount(void);              // Week 5, Problem 2
++int getprocstate(int);              // Week 5, Problem 3
++int getcmdline(char *buf, int max); // Week 5, Problem 4
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("getsyscount");
++entry("getprocstate");
++entry("getcmdline");
